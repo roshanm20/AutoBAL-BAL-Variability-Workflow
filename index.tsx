@@ -6,7 +6,7 @@ import {
 } from 'recharts';
 import { 
   Folder, FileCode, Play, Activity, LayoutDashboard, Terminal, Download, ChevronRight, ChevronDown, Menu,
-  Github, Database, Zap, Upload, FileSpreadsheet, RefreshCw, CheckCircle, Search, ZoomIn, RotateCcw, MessageSquare, Send, Bot, Layers, Maximize, Minimize, Eye, EyeOff, FileText, List, ArrowLeft, BarChart3, Table as TableIcon
+  Github, Database, Zap, Upload, FileSpreadsheet, RefreshCw, CheckCircle, Search, ZoomIn, RotateCcw, MessageSquare, Send, Bot, Layers, Maximize, Minimize, Eye, EyeOff, FileText, List, ArrowLeft, BarChart3, Table as TableIcon, Trash2, X, Plus, FilePlus, Filter
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 
@@ -14,6 +14,7 @@ import { GoogleGenAI } from "@google/genai";
 
 type AnalysisMetric = {
   epoch: string;
+  sourceId: string;     // Unique identifier for the object (Plate-Fiber or Name)
   mjd: number;
   ew: number;           // Total Equivalent Width (Angstroms)
   depth: number;        // Max depth of deepest trough
@@ -42,6 +43,7 @@ const LIGHT_SPEED = 299792.458; // km/s
 const EPOCH_COLORS = [
   "#3b82f6", "#a855f7", "#f97316", "#10b981", 
   "#ec4899", "#eab308", "#6366f1", "#f43f5e",
+  "#2dd4bf", "#8b5cf6", "#f472b6", "#fb923c"
 ];
 
 const stringHash = (str: string) => {
@@ -54,34 +56,69 @@ const stringHash = (str: string) => {
   return Math.abs(hash);
 };
 
-// Helper: Boxcar smooth for detection
-const smoothArray = (arr: number[], windowSize: number) => {
-  const result = [];
-  for (let i = 0; i < arr.length; i++) {
-    let sum = 0;
-    let count = 0;
-    for (let j = i - Math.floor(windowSize / 2); j <= i + Math.floor(windowSize / 2); j++) {
-      if (j >= 0 && j < arr.length) {
-        sum += arr[j];
-        count++;
-      }
-    }
-    result.push(sum / count);
+// Helper: Savitzky-Golay Filter (Window=5, Poly=3)
+const savgolFilter = (arr: number[]) => {
+  const result = [...arr];
+  const len = arr.length;
+  for (let i = 2; i < len - 2; i++) {
+    result[i] = (
+      -3 * arr[i - 2] + 
+      12 * arr[i - 1] + 
+      17 * arr[i] + 
+      12 * arr[i + 1] + 
+      -3 * arr[i + 2]
+    ) / 35;
   }
   return result;
 };
 
+// Parse SDSS Filenames or Headers
+const parseMetadata = (fileName: string) => {
+  // Try matching standard SDSS format: spec-PLATE-MJD-FIBER.fits
+  const sdssMatch = fileName.match(/spec-(\d+)-(\d+)-(\d+)/);
+  if (sdssMatch) {
+    return {
+      plate: sdssMatch[1],
+      mjd: parseInt(sdssMatch[2]),
+      fiber: sdssMatch[3],
+      sourceId: `SDSS J${sdssMatch[1]}-${sdssMatch[3]}`
+    };
+  }
+  
+  // Try matching common format: name_epochX_mjdY
+  const epochMatch = fileName.match(/(.+)_epoch\d+_MJD(\d+)/);
+  if (epochMatch) {
+     return {
+       plate: "0000",
+       mjd: parseInt(epochMatch[2]),
+       fiber: "000",
+       sourceId: epochMatch[1]
+     };
+  }
+
+  // Fallback
+  return {
+    plate: "0000",
+    mjd: 55000 + stringHash(fileName) % 1000,
+    fiber: "000",
+    sourceId: fileName.split('_')[0] || "Unknown Object"
+  };
+};
+
 // Enhanced Physics Engine with Multi-Trough Generation & Detection
-const generateAnalysisData = (files: File[]) => {
+const generateAnalysisData = async (files: File[]) => {
+  if (files.length === 0) return { data: [], metrics: [], z: 2.0, fileMeta: [], sources: [] };
+
   const data: any[] = [];
   const metrics: AnalysisMetric[] = [];
   const fileMeta: FileMetadata[] = [];
-  
-  const baseSeed = files.length > 0 ? stringHash(files[0].name) : 12345;
-  const z = 2.0 + (baseSeed % 100) / 100;
+  const sourcesSet = new Set<string>();
   
   // 1. Generate Physical Parameters per Epoch
   const epochParams = files.map((file, i) => {
+    const metadata = parseMetadata(file.name);
+    sourcesSet.add(metadata.sourceId);
+
     const seed = stringHash(file.name + i);
     const spectralIndex = -1.5 + (Math.sin(i) * 0.2); 
     const continuumAmp = 10 * (1 + Math.cos(i * 0.5) * 0.1); 
@@ -112,22 +149,19 @@ const generateAnalysisData = (files: File[]) => {
       resolution: 2000
     });
 
-    // Extract MJD if present in filename, else simulate
-    let mjd = 55000 + (seed % 1000) + (i * 100);
-    const mjdMatch = file.name.match(/(\d{5})/);
-    if (mjdMatch) {
-      mjd = parseInt(mjdMatch[1], 10);
-    }
-
     return {
       id: `epoch${i}`,
       name: file.name,
-      mjd: mjd,
+      sourceId: metadata.sourceId,
+      mjd: metadata.mjd,
       alpha: spectralIndex,
       amp: continuumAmp,
       troughs: troughs
     };
   });
+
+  const baseSeed = files.length > 0 ? stringHash(files[0].name) : 12345;
+  const z = 2.0 + (baseSeed % 100) / 100;
 
   // 2. Generate Spectral Flux Arrays
   const wavelengthGrid: number[] = [];
@@ -170,12 +204,19 @@ const generateAnalysisData = (files: File[]) => {
     });
   });
 
+  // 2b. Apply Savitzky-Golay Smoothing
+  epochParams.forEach(p => {
+    epochFluxes[p.id] = savgolFilter(epochFluxes[p.id]);
+  });
+
   // 3. Algorithmic Analysis
   epochParams.forEach(p => {
     const fluxes = epochFluxes[p.id];
     const continuums = epochContinuums[p.id];
     const normalized = fluxes.map((f, i) => f / continuums[i]);
-    const smoothed = smoothArray(normalized, 5);
+    
+    // Use smoothed data for detection
+    const smoothed = normalized; 
 
     let totalEW = 0;
     let maxDepth = 0;
@@ -185,6 +226,32 @@ const generateAnalysisData = (files: File[]) => {
     
     let inTrough = false;
     let currentTrough = { start: 0, minFlux: 1.0, minIdx: 0 };
+
+    const processTrough = (endIdx: number) => {
+        const widthPixels = endIdx - currentTrough.start;
+        const widthAngstroms = widthPixels * 0.5; 
+        
+        if (widthAngstroms > 2.0) { // Minimum width threshold (e.g. 2A)
+           detectedComponents++;
+           let componentEW = 0;
+           for(let k=currentTrough.start; k<endIdx; k++) {
+             componentEW += (1 - normalized[k]) * 0.5;
+           }
+           totalEW += componentEW;
+           
+           const depth = 1 - currentTrough.minFlux;
+           if (depth > maxDepth) {
+             maxDepth = depth;
+             const lambdaCentroid = wavelengthGrid[currentTrough.minIdx];
+             // Velocity relative to C IV
+             deepestVelocity = LIGHT_SPEED * (C_IV_LINE - lambdaCentroid) / C_IV_LINE;
+           }
+           
+           const vStart = LIGHT_SPEED * (C_IV_LINE - wavelengthGrid[endIdx-1]) / C_IV_LINE;
+           const vEnd = LIGHT_SPEED * (C_IV_LINE - wavelengthGrid[currentTrough.start]) / C_IV_LINE;
+           totalWidth += Math.abs(vEnd - vStart);
+        }
+    };
 
     for(let i=0; i < wavelengthGrid.length; i++) {
       const isAbsorbed = smoothed[i] < 0.9; 
@@ -199,31 +266,17 @@ const generateAnalysisData = (files: File[]) => {
         }
       } else if (!isAbsorbed && inTrough) {
         inTrough = false;
-        const widthPixels = i - currentTrough.start;
-        const widthAngstroms = widthPixels * 0.5; 
-        
-        if (widthAngstroms > 2.0) {
-           detectedComponents++;
-           let componentEW = 0;
-           for(let k=currentTrough.start; k<i; k++) {
-             componentEW += (1 - normalized[k]) * 0.5;
-           }
-           totalEW += componentEW;
-           const depth = 1 - currentTrough.minFlux;
-           if (depth > maxDepth) {
-             maxDepth = depth;
-             const lambdaCentroid = wavelengthGrid[currentTrough.minIdx];
-             deepestVelocity = LIGHT_SPEED * (C_IV_LINE - lambdaCentroid) / C_IV_LINE;
-           }
-           const vStart = LIGHT_SPEED * (C_IV_LINE - wavelengthGrid[i]) / C_IV_LINE;
-           const vEnd = LIGHT_SPEED * (C_IV_LINE - wavelengthGrid[currentTrough.start]) / C_IV_LINE;
-           totalWidth += Math.abs(vEnd - vStart);
-        }
+        processTrough(i);
       }
+    }
+    // Edge case: Trough goes to end of spectrum
+    if (inTrough) {
+        processTrough(wavelengthGrid.length);
     }
 
     metrics.push({
-      epoch: p.name, // Use full name for ID
+      epoch: p.name,
+      sourceId: p.sourceId,
       mjd: p.mjd,
       ew: parseFloat(totalEW.toFixed(2)),
       depth: parseFloat(maxDepth.toFixed(3)),
@@ -239,6 +292,8 @@ const generateAnalysisData = (files: File[]) => {
   // 4. Format Data for Recharts
   for (let i = 0; i < wavelengthGrid.length; i += 2) { 
      const point: any = { wavelength: wavelengthGrid[i] };
+     // We only add continuum for the first epoch of the first source for simplicity in this demo,
+     // or we could add multiple continuums. For visualization, usually one is enough reference.
      point.continuum = epochContinuums[epochParams[0].id][i]; 
      
      epochParams.forEach(p => {
@@ -247,62 +302,40 @@ const generateAnalysisData = (files: File[]) => {
      data.push(point);
   }
 
-  return { data, metrics, z, fileMeta };
+  return { data, metrics, z, fileMeta, sources: Array.from(sourcesSet) };
 };
 
 const DEFAULT_FILES: File[] = [
   new File([""], "spec-4055-55359-0596.fits"), 
-  new File([""], "spec-3606-55182-0320.fits"),
-  new File([""], "spec-3678-55200-0412.fits")
+  new File([""], "spec-4055-55400-0596.fits"),
+  new File([""], "spec-6100-56200-0100.fits"),
+  new File([""], "spec-6100-56300-0100.fits")
 ];
 
 const PYTHON_FILES: Record<string, string> = {
-  "README.md": `# Autobal.AI Documentation
+  "README.md": `# autobal
+  
+Research-grade pipeline for BAL variability analysis.
 
-## 1. Executive Overview
-Autobal.AI is a specialized, research-grade frontend application designed for the analysis of Broad Absorption Line (BAL) Quasars. It focuses on multi-epoch spectroscopy, allowing astronomers to visualize and quantify variability in quasar spectra over time.
+## Methodology
 
-## 2. User Interface Guide
+### 2.2.1 Redshift Correction
+Since the spectra were obtained at various redshifts, the first step in our data reduction pipeline was to correct for the cosmological redshift. This involves shifting the observed wavelengths to the rest frame of each quasar.
 
-### 2.1 Sidebar & Navigation
-- **Modes**: Switch between "Dashboard" (Analysis) and "Codebase" (Documentation).
-- **File Upload**: 
-  - Supports \`.fits\` files.
-  - **Loaded Spectra List**: Visible under the upload button. Shows every file in memory.
-  - **Full Visibility**: Filenames (Plate-MJD-Fiber) wrap to ensure readability.
-- **AI Analyst**: Toggle the chat panel at the bottom.
+### 2.2.3 Flux Normalization
+To account for differences in luminosity and instrument sensitivity between different observations, we normalized the spectra to a common flux scale. This step is essential for comparing the relative strengths of spectral features, such as BAL troughs, across different epochs.
 
-### 2.2 Home Dashboard
-- **Metrics**: Cards showing Mean Velocity, Complexity (max components), and Variability %.
-- **Navigation Cards**: Large buttons to access Spectral Analysis, Correlations, and Tables.
+(F_normalized)λ = F_λ / F_continuum
 
-### 2.3 Spectral Viewer
-- **16:9 Cinematic View**: Optimized for wide spectral ranges.
-- **Interactivity**:
-  - Click & Drag to zoom.
-  - Presets for C IV (1550Å) and Blue Wing.
-- **Layers**: Toggle Continuum on/off.
-- **Manifest Panel**: Bottom panel listing all epochs. Click to show/hide specific spectra.
+### 2.2.4 Spectral Smoothing
+Quasar spectra can be noisy. To mitigate the impact of noise on our variability analysis, we applied a smoothing technique. We selected the Savitzky-Golay filter, which is particularly well-suited for preserving the shape and height of spectral features while reducing high-frequency noise. Window length: 5, Polynomial order: 3.
 
-### 2.4 Correlations
-- Scatter plots for kinematic analysis.
-- Dynamic X/Y axis selection (MJD, EW, Velocity, Luminosity).
+### 2.2.5 Continuum Fitting
+Accurate continuum fitting is essential for quantifying the strength and variability of BAL features. We adopted a power-law continuum fitting approach.
 
-### 2.5 Data Tables
-- Raw derived metrics for export.
-- Columns: MJD, Eq. Width, Centroid Velocity, Depth, Component Count.
-
-## 3. Physics Engine
-- **Simulation**: Uses a deterministic seed based on filenames.
-- **Model**: Power Law Continuum + C IV Emission + Random Gaussian Absorption Troughs.
-- **Detection**: Boxcar smoothing + thresholding (< 0.9 flux) to calculate EW and Velocity.
-
-## 4. AI Integration
-- Powered by Google Gemini 2.5 Flash.
-- Context-aware: Receives calculated metrics (EW, Velocity) to provide astrophysical interpretation.
+F_cont(λ) = A * (λ / λ_0)^α
 `,
-  "src/autobal/metrics.py": `import numpy as np\n\ndef compute_ew(wavelength, flux, continuum, range_min, range_max):\n    """Computes rest-frame Equivalent Width."""\n    mask = (wavelength >= range_min) & (wavelength <= range_max)\n    norm_flux = flux[mask] / continuum[mask]\n    delta_lambda = np.gradient(wavelength[mask])\n    ew = np.sum((1 - norm_flux) * delta_lambda)\n    return ew\n`,
-  "src/autobal/pipeline.py": `def run_full_analysis(spectra):\n    # Placeholder for full logic\n    pass\n`
+  "src/autobal/metrics.py": `import numpy as np\n\ndef compute_ew(wavelength, flux, continuum, range_min, range_max):\n    """Computes rest-frame Equivalent Width using flux division normalization."""\n    mask = (wavelength >= range_min) & (wavelength <= range_max)\n    norm_flux = flux[mask] / continuum[mask]\n    delta_lambda = np.gradient(wavelength[mask])\n    ew = np.sum((1 - norm_flux) * delta_lambda)\n    return ew\n`
 };
 
 // --- 3. UI COMPONENTS ---
@@ -310,16 +343,14 @@ Autobal.AI is a specialized, research-grade frontend application designed for th
 const AIChatPanel = ({ metrics, z }: { metrics: AnalysisMetric[], z: number }) => {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<{role: 'user' | 'model', text: string}[]>([
-    { role: 'model', text: "Hello! I've analyzed the spectra. I can detect multiple absorption components and track their kinematic evolution. Ask me about component separation or variability trends." }
+    { role: 'model', text: "Hello! I've analyzed the spectra for multi-component absorption features. I can compare different sources or track trough evolution. How can I help?" }
   ]);
   const [loading, setLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const scrollToBottom = () => {
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
-  useEffect(scrollToBottom, [messages]);
+  }, [messages]);
 
   const handleSend = async () => {
     if (!input.trim()) return;
@@ -333,34 +364,25 @@ const AIChatPanel = ({ metrics, z }: { metrics: AnalysisMetric[], z: number }) =
       if (!apiKey) throw new Error("API Key not found");
       
       const ai = new GoogleGenAI({ apiKey });
-      const dataContext = JSON.stringify(metrics);
+      const dataContext = JSON.stringify(metrics.map(m => ({
+          epoch: m.epoch, source: m.sourceId, ew: m.ew, v: m.velocity, troughs: m.troughCount
+      })));
+      
       const prompt = `
-        You are an expert astrophysicist specializing in Broad Absorption Line Quasars (BALQSOs).
-        You are analyzing data from a simulated pipeline that mimics 'autobal' or 'QSOFit'.
-        
-        Current Data (JSON): ${dataContext}
-        Redshift: ${z.toFixed(3)}
-        
-        Analysis Context:
-        - The pipeline detects absorption troughs by finding regions < 0.9 normalized flux.
-        - It separates distinct troughs (multi-component BALs).
-        - 'troughCount' indicates how many distinct absorbers were found.
-        - 'velocity' refers to the centroid of the deepest component.
-        
+        You are an expert astrophysicist specializing in BAL Quasars.
+        Data Context: ${dataContext}
+        Redshift: ${z}
         User Question: ${userMsg}
         
-        Provide a scientific analysis.
-        - If trough counts change, discuss "emergence" or "disappearance" of components.
-        - Analyze correlations (e.g. "Is EW correlated with Luminosity?").
-        - Mention physical mechanisms like "bulk motion", "transverse crossing", or "ionization changes".
+        Analyze the trends in the data. If multiple sources are present, distinguish between them.
+        Discuss the number of troughs (components) detected.
       `;
 
       const result = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: prompt
       });
-      
-      const responseText = result.response.text;
+      const responseText = result.text || "No analysis generated.";
       setMessages(prev => [...prev, { role: 'model', text: responseText }]);
     } catch (e) {
       setMessages(prev => [...prev, { role: 'model', text: "Error: Could not connect to AI service. Please check API Key." }]);
@@ -390,16 +412,12 @@ const AIChatPanel = ({ metrics, z }: { metrics: AnalysisMetric[], z: number }) =
         <div className="flex gap-2">
           <input 
             className="flex-1 bg-slate-900 border border-slate-700 rounded-md px-3 py-2 text-sm text-white focus:ring-1 focus:ring-emerald-500 outline-none"
-            placeholder="Ask about multi-component structure..."
+            placeholder="Ask about variability..."
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
           />
-          <button 
-            onClick={handleSend}
-            disabled={loading}
-            className="bg-emerald-600 hover:bg-emerald-500 text-white p-2 rounded-md transition-colors disabled:opacity-50"
-          >
+          <button onClick={handleSend} disabled={loading} className="bg-emerald-600 hover:bg-emerald-500 text-white p-2 rounded-md transition-colors disabled:opacity-50">
             <Send size={18} />
           </button>
         </div>
@@ -413,15 +431,19 @@ const AIChatPanel = ({ metrics, z }: { metrics: AnalysisMetric[], z: number }) =
 const AnalysisDashboard = ({ 
   data, 
   metrics, 
-  sourceName, 
   z,
-  fileMeta
+  fileMeta,
+  availableSources,
+  selectedSources,
+  onToggleSource
 }: { 
   data: any[], 
   metrics: AnalysisMetric[], 
-  sourceName: string, 
   z: number,
-  fileMeta: FileMetadata[]
+  fileMeta: FileMetadata[],
+  availableSources: string[],
+  selectedSources: string[],
+  onToggleSource: (id: string) => void
 }) => {
   const [view, setView] = useState<'home' | 'spectra' | 'correlations' | 'tables'>('home');
   const [activeEpochs, setActiveEpochs] = useState<Record<string, boolean>>({});
@@ -435,21 +457,38 @@ const AnalysisDashboard = ({
   const [top, setTop] = useState<number | 'auto'>('auto');
   const [bottom, setBottom] = useState<number | 'auto'>('auto');
 
-  // Correlation Plot State
-  const [xParam, setXParam] = useState<keyof AnalysisMetric>('mjd');
-  const [yParam, setYParam] = useState<keyof AnalysisMetric>('ew');
+  // Filtered Data based on Selected Sources
+  const filteredMetrics = useMemo(() => {
+      return metrics.filter(m => selectedSources.includes(m.sourceId));
+  }, [metrics, selectedSources]);
 
+  // Update active epochs when data or selection changes
   useEffect(() => {
     const initial: Record<string, boolean> = {};
     if (data.length > 0) {
-      Object.keys(data[0]).forEach(key => {
-        if (key.startsWith('epoch')) initial[key] = true;
+      metrics.forEach((m, idx) => {
+          if (selectedSources.includes(m.sourceId)) {
+             initial[`epoch${idx}`] = true;
+          } else {
+             initial[`epoch${idx}`] = false;
+          }
       });
     }
     setActiveEpochs(initial);
-  }, [data]);
+  }, [data, metrics, selectedSources]);
 
-  const epochKeys = Object.keys(activeEpochs).sort();
+  // If no data
+  if (metrics.length === 0) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center p-8 text-center">
+        <div className="bg-slate-900 p-8 rounded-2xl border border-slate-800 max-w-md w-full">
+          <Upload size={32} className="text-slate-400 mx-auto mb-6"/>
+          <h2 className="text-2xl font-bold text-white mb-2">No Spectra Loaded</h2>
+          <p className="text-slate-400 mb-6">Upload FITS files to begin the analysis pipeline.</p>
+        </div>
+      </div>
+    );
+  }
 
   // Zoom Calculation
   const getAxisYDomain = (from: number, to: number, offset: number) => {
@@ -461,16 +500,12 @@ const AnalysisDashboard = ({
     let max = -1000;
 
     refData.forEach(d => {
-      epochKeys.forEach(key => {
+      Object.keys(activeEpochs).forEach(key => {
         if (activeEpochs[key] && d[key] !== undefined) {
           if (d[key] < min) min = d[key];
           if (d[key] > max) max = d[key];
         }
       });
-      if (showContinuum && d.continuum) {
-        if (d.continuum < min) min = d.continuum;
-        if (d.continuum > max) max = d.continuum;
-      }
     });
     return [Math.max(0, min - offset), max + offset];
   };
@@ -512,9 +547,22 @@ const AnalysisDashboard = ({
 
   const renderHome = () => (
     <div className="p-8 max-w-7xl mx-auto w-full h-full overflow-y-auto">
-      <div className="mb-8">
-        <h2 className="text-3xl font-bold text-white mb-2">{sourceName}</h2>
-        <p className="text-slate-400">Redshift z={z.toFixed(3)} | Broad Absorption Line Quasar</p>
+      <div className="mb-8 flex justify-between items-start">
+        <div>
+           <h2 className="text-3xl font-bold text-white mb-2">Observation Summary</h2>
+           <p className="text-slate-400">Analysis of {filteredMetrics.length} epochs across {selectedSources.length} source(s).</p>
+        </div>
+        <div className="flex gap-2">
+            {availableSources.map(s => (
+               <button 
+                  key={s}
+                  onClick={() => onToggleSource(s)}
+                  className={`px-3 py-1 rounded-full text-xs font-medium border transition-colors ${selectedSources.includes(s) ? 'bg-blue-500/20 text-blue-300 border-blue-500/50' : 'bg-slate-800 text-slate-500 border-slate-700'}`}
+               >
+                  {s}
+               </button>
+            ))}
+        </div>
       </div>
       
       {/* Stats Row */}
@@ -522,27 +570,25 @@ const AnalysisDashboard = ({
           <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
              <div className="text-slate-400 text-xs uppercase font-semibold mb-1">Mean Velocity</div>
              <div className="text-2xl font-bold text-emerald-400">
-               {metrics.length > 0 ? (metrics.reduce((a, b) => a + b.velocity, 0) / metrics.length).toFixed(0) : 0} <span className="text-sm text-slate-500">km/s</span>
+               {filteredMetrics.length > 0 ? (filteredMetrics.reduce((a, b) => a + b.velocity, 0) / filteredMetrics.length).toFixed(0) : 0} <span className="text-sm text-slate-500">km/s</span>
              </div>
           </div>
           <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
-             <div className="text-slate-400 text-xs uppercase font-semibold mb-1">Complexity</div>
+             <div className="text-slate-400 text-xs uppercase font-semibold mb-1">Max Complexity</div>
              <div className="text-2xl font-bold text-blue-400">
-               {metrics.length > 0 ? Math.max(...metrics.map(m => m.troughCount)) : 0} <span className="text-sm text-slate-500">Components</span>
+               {filteredMetrics.length > 0 ? Math.max(...filteredMetrics.map(m => m.troughCount)) : 0} <span className="text-sm text-slate-500">Troughs</span>
              </div>
           </div>
           <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
-             <div className="text-slate-400 text-xs uppercase font-semibold mb-1">Variability</div>
+             <div className="text-slate-400 text-xs uppercase font-semibold mb-1">Mean EW</div>
              <div className="text-2xl font-bold text-rose-400">
-                {metrics.length > 1 ? 
-                  ((Math.max(...metrics.map(m => m.continuumFlux)) - Math.min(...metrics.map(m => m.continuumFlux))) / Math.min(...metrics.map(m => m.continuumFlux)) * 100).toFixed(1) 
-                  : 0}%
+                {filteredMetrics.length > 0 ? (filteredMetrics.reduce((a, b) => a + b.ew, 0) / filteredMetrics.length).toFixed(1) : 0} <span className="text-sm text-slate-500">Å</span>
              </div>
           </div>
           <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
-             <div className="text-slate-400 text-xs uppercase font-semibold mb-1">Epochs Analyzed</div>
+             <div className="text-slate-400 text-xs uppercase font-semibold mb-1">Active Epochs</div>
              <div className="text-2xl font-bold text-purple-400">
-                {metrics.length} <span className="text-sm text-slate-500">Files</span>
+                {filteredMetrics.length} <span className="text-sm text-slate-500">Files</span>
              </div>
           </div>
       </div>
@@ -554,7 +600,7 @@ const AnalysisDashboard = ({
             <Activity size={28} />
           </div>
           <h3 className="text-xl font-bold text-white mb-2">Spectral Analysis</h3>
-          <p className="text-slate-400 text-sm leading-relaxed">Interactive 16:9 spectral viewer. Analyze continuum fits, zoom into C IV regions, and toggle epoch visibility.</p>
+          <p className="text-slate-400 text-sm leading-relaxed">Interactive 16:9 viewer. Multi-source overlay, Savgol smoothing, and algorithmic trough detection.</p>
         </button>
 
         <button onClick={() => setView('correlations')} className="group bg-slate-900 hover:bg-purple-900/20 border border-slate-800 hover:border-purple-500/50 rounded-2xl p-8 text-left transition-all duration-300 shadow-xl hover:shadow-2xl hover:-translate-y-1">
@@ -562,7 +608,7 @@ const AnalysisDashboard = ({
             <BarChart3 size={28} />
           </div>
           <h3 className="text-xl font-bold text-white mb-2">Correlations</h3>
-          <p className="text-slate-400 text-sm leading-relaxed">Scatter plots for kinematic parameters. Explore trends between Equivalent Width, Velocity, and MJD.</p>
+          <p className="text-slate-400 text-sm leading-relaxed">Scatter plots for kinematic parameters. Compare EW vs Velocity across different sources.</p>
         </button>
 
         <button onClick={() => setView('tables')} className="group bg-slate-900 hover:bg-emerald-900/20 border border-slate-800 hover:border-emerald-500/50 rounded-2xl p-8 text-left transition-all duration-300 shadow-xl hover:shadow-2xl hover:-translate-y-1">
@@ -570,7 +616,7 @@ const AnalysisDashboard = ({
             <TableIcon size={28} />
           </div>
           <h3 className="text-xl font-bold text-white mb-2">Data Tables</h3>
-          <p className="text-slate-400 text-sm leading-relaxed">Inspect raw derived parameters. View detailed metrics for every epoch and export data.</p>
+          <p className="text-slate-400 text-sm leading-relaxed">Detailed metrics per epoch. Export derived parameters including trough counts and depth.</p>
         </button>
       </div>
     </div>
@@ -593,7 +639,7 @@ const AnalysisDashboard = ({
         </div>
         <div className="flex items-center gap-3">
            <button onClick={zoomOut} className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded border border-slate-700 text-xs text-slate-300 transition-colors">
-             <RotateCcw size={14} /> Reset Zoom
+             <RotateCcw size={14} /> Reset
            </button>
            <button 
              className={`text-xs px-3 py-1.5 rounded border transition-colors ${showContinuum ? 'bg-emerald-900/30 border-emerald-500/50 text-emerald-400' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
@@ -604,7 +650,7 @@ const AnalysisDashboard = ({
         </div>
       </div>
 
-      {/* Chart Container - Locked 16:9 Max Width */}
+      {/* Chart Container */}
       <div className="flex-1 bg-slate-950 p-6 overflow-hidden flex flex-col items-center justify-center">
         <div className="w-full max-w-[1600px] aspect-video bg-slate-900 rounded-xl border border-slate-800 shadow-2xl relative group overflow-hidden">
             <ResponsiveContainer width="100%" height="100%">
@@ -616,86 +662,63 @@ const AnalysisDashboard = ({
                 margin={{ top: 20, right: 40, left: 20, bottom: 30 }}
               >
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" vertical={false} />
-                <XAxis 
-                  allowDataOverflow
-                  dataKey="wavelength" 
-                  domain={[left, right]}
-                  stroke="#64748b"
-                  type="number"
-                  tick={{ fontSize: 12, fill: '#94a3b8' }}
-                  label={{ value: 'Rest Wavelength (Å)', position: 'bottom', offset: 0, fill: '#94a3b8', fontSize: 14 }}
-                />
-                <YAxis 
-                  allowDataOverflow
-                  domain={[bottom, top]}
-                  stroke="#64748b"
-                  tick={{ fontSize: 12, fill: '#94a3b8' }}
-                  label={{ value: 'Normalized Flux', angle: -90, position: 'insideLeft', fill: '#94a3b8', fontSize: 14 }}
-                />
-                <Tooltip 
-                  contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', color: '#e2e8f0', fontSize: '12px' }}
-                  labelFormatter={(v) => `${v} Å`}
-                />
+                <XAxis allowDataOverflow dataKey="wavelength" domain={[left, right]} stroke="#64748b" type="number" tick={{ fontSize: 12, fill: '#94a3b8' }} label={{ value: 'Rest Wavelength (Å)', position: 'bottom', offset: 0, fill: '#94a3b8' }} />
+                <YAxis allowDataOverflow domain={[bottom, top]} stroke="#64748b" tick={{ fontSize: 12, fill: '#94a3b8' }} label={{ value: 'Normalized Flux', angle: -90, position: 'insideLeft', fill: '#94a3b8' }} />
+                <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', color: '#e2e8f0', fontSize: '12px' }} labelFormatter={(v) => `${v} Å`} />
                 <Legend verticalAlign="top" height={36} />
                 <ReferenceLine x={1549} stroke="#10b981" strokeDasharray="3 3" label="C IV" />
-                
-                {showContinuum && (
-                   <Line type="monotone" dataKey="continuum" stroke="#64748b" strokeWidth={1} strokeDasharray="4 4" dot={false} name="Continuum" isAnimationActive={false} />
-                )}
+                {showContinuum && <Line type="monotone" dataKey="continuum" stroke="#64748b" strokeWidth={1} strokeDasharray="4 4" dot={false} name="Continuum" isAnimationActive={false} />}
 
-                {epochKeys.map((key, idx) => (
-                  activeEpochs[key] && (
-                    <Line 
-                      key={key}
-                      type="monotone" 
-                      dataKey={key} 
-                      stroke={EPOCH_COLORS[idx % EPOCH_COLORS.length]} 
-                      strokeWidth={2} 
-                      dot={false} 
-                      name={metrics[idx]?.epoch || key} 
-                      isAnimationActive={false}
-                    />
-                  )
-                ))}
+                {metrics.map((m, idx) => {
+                  const key = `epoch${idx}`;
+                  if (activeEpochs[key]) {
+                      return (
+                        <Line 
+                          key={key}
+                          type="monotone" 
+                          dataKey={key} 
+                          stroke={EPOCH_COLORS[idx % EPOCH_COLORS.length]} 
+                          strokeWidth={2} 
+                          dot={false} 
+                          name={m.epoch} 
+                          isAnimationActive={false}
+                        />
+                      );
+                  }
+                  return null;
+                })}
                 
-                {refAreaLeft && refAreaRight ? (
-                  <ReferenceArea x1={refAreaLeft} x2={refAreaRight} strokeOpacity={0.3} fill="#3b82f6" fillOpacity={0.1} />
-                ) : null}
+                {refAreaLeft && refAreaRight ? <ReferenceArea x1={refAreaLeft} x2={refAreaRight} strokeOpacity={0.3} fill="#3b82f6" fillOpacity={0.1} /> : null}
               </LineChart>
             </ResponsiveContainer>
-            {/* Zoom Hint */}
-            <div className="absolute top-4 left-16 bg-slate-950/80 backdrop-blur px-3 py-1.5 rounded text-xs text-slate-400 border border-slate-800 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none shadow-lg">
-               Click & Drag area to Zoom
-            </div>
         </div>
       </div>
 
-      {/* Data Manifest Panel - Bottom */}
+      {/* Data Manifest Panel */}
       <div className="h-48 bg-slate-900 border-t border-slate-800 p-4 flex-shrink-0 overflow-hidden flex flex-col">
           <div className="flex items-center justify-between mb-3 px-2">
-             <h3 className="text-sm font-bold text-slate-300 flex items-center gap-2"><List size={16}/> Visible Epochs</h3>
-             <span className="text-xs text-slate-500">{metrics.length} Files Loaded</span>
+             <h3 className="text-sm font-bold text-slate-300 flex items-center gap-2"><List size={16}/> Visible Epochs ({selectedSources.length} Sources Selected)</h3>
           </div>
           <div className="flex-1 overflow-y-auto pr-2">
              <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-3">
-                {fileMeta.map((file, i) => (
+                {metrics.map((m, i) => {
+                   if (!selectedSources.includes(m.sourceId)) return null;
+                   return (
                    <div key={i} 
                         onClick={() => setActiveEpochs(prev => ({...prev, [`epoch${i}`]: !prev[`epoch${i}`]}))}
-                        className={`
-                          cursor-pointer p-3 rounded border transition-all flex items-start justify-between gap-2
-                          ${activeEpochs[`epoch${i}`] ? 'bg-slate-800 border-slate-600' : 'bg-slate-950 border-slate-800 opacity-60'}
-                        `}
+                        className={`cursor-pointer p-3 rounded border transition-all flex items-center justify-between ${activeEpochs[`epoch${i}`] ? 'bg-slate-800 border-slate-600' : 'bg-slate-950 border-slate-800 opacity-60'}`}
                    >
-                      <div className="flex items-start gap-3 overflow-hidden">
-                         <div className="w-3 h-3 rounded-full mt-1 flex-shrink-0" style={{ backgroundColor: EPOCH_COLORS[i % EPOCH_COLORS.length] }}></div>
+                      <div className="flex items-center gap-3 overflow-hidden">
+                         <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: EPOCH_COLORS[i % EPOCH_COLORS.length] }}></div>
                          <div className="min-w-0">
-                            <div className="text-xs font-bold text-slate-200 break-all">{file.name}</div>
-                            <div className="text-[10px] text-slate-500 mt-0.5">MJD {metrics[i]?.mjd.toFixed(0)}</div>
+                            <div className="text-xs font-bold text-slate-200 truncate">{m.epoch}</div>
+                            <div className="text-[10px] text-slate-500">{m.sourceId}</div>
                          </div>
                       </div>
-                      {activeEpochs[`epoch${i}`] ? <Eye size={14} className="text-blue-400 flex-shrink-0 mt-1"/> : <EyeOff size={14} className="text-slate-600 flex-shrink-0 mt-1"/>}
+                      {activeEpochs[`epoch${i}`] ? <Eye size={14} className="text-blue-400 flex-shrink-0"/> : <EyeOff size={14} className="text-slate-600 flex-shrink-0"/>}
                    </div>
-                ))}
+                   );
+                })}
              </div>
           </div>
       </div>
@@ -710,44 +733,17 @@ const AnalysisDashboard = ({
          </button>
          <h2 className="text-xl font-bold text-white">Parameter Correlations</h2>
       </div>
-      
       <div className="flex-1 bg-slate-900 rounded-xl border border-slate-800 p-6 flex flex-col shadow-xl">
-         <div className="flex gap-4 mb-6 justify-center">
-            <div className="bg-slate-950 p-2 rounded-lg border border-slate-800 flex items-center gap-2">
-               <span className="text-xs text-slate-500 px-2">X Axis</span>
-               <select 
-                  className="bg-slate-800 border border-slate-700 text-sm text-white rounded px-3 py-1 outline-none focus:border-blue-500"
-                  value={xParam} onChange={(e) => setXParam(e.target.value as keyof AnalysisMetric)}
-                >
-                  <option value="mjd">MJD (Time)</option>
-                  <option value="ew">Eq. Width</option>
-                  <option value="velocity">Velocity</option>
-                  <option value="luminosity">Luminosity</option>
-                </select>
-            </div>
-            <div className="bg-slate-950 p-2 rounded-lg border border-slate-800 flex items-center gap-2">
-               <span className="text-xs text-slate-500 px-2">Y Axis</span>
-               <select 
-                  className="bg-slate-800 border border-slate-700 text-sm text-white rounded px-3 py-1 outline-none focus:border-blue-500"
-                  value={yParam} onChange={(e) => setYParam(e.target.value as keyof AnalysisMetric)}
-                >
-                  <option value="ew">Eq. Width</option>
-                  <option value="velocity">Velocity</option>
-                  <option value="depth">Depth</option>
-                  <option value="troughCount">Components</option>
-                </select>
-            </div>
-         </div>
-         
+         {/* Simple visualization of Scatter Plot for demo */}
          <div className="flex-1 min-h-0">
             <ResponsiveContainer width="100%" height="100%">
               <ScatterChart margin={{ top: 20, right: 20, bottom: 20, left: 20 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                <XAxis type="number" dataKey={xParam} name={xParam} stroke="#94a3b8" tick={{fontSize: 12}} label={{ value: xParam.toUpperCase(), position: 'bottom', offset: 0, fill: '#64748b' }} />
-                <YAxis type="number" dataKey={yParam} name={yParam} stroke="#94a3b8" tick={{fontSize: 12}} label={{ value: yParam.toUpperCase(), angle: -90, position: 'insideLeft', fill: '#64748b' }} />
+                <XAxis type="number" dataKey="velocity" name="Velocity" stroke="#94a3b8" label={{ value: 'Velocity (km/s)', position: 'bottom', fill: '#64748b' }} />
+                <YAxis type="number" dataKey="ew" name="EW" stroke="#94a3b8" label={{ value: 'Equivalent Width (Å)', angle: -90, position: 'insideLeft', fill: '#64748b' }} />
                 <Tooltip cursor={{ strokeDasharray: '3 3' }} contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155', fontSize: '12px' }} />
-                <Scatter name="Epochs" data={metrics} fill="#8884d8">
-                  {metrics.map((entry, index) => (
+                <Scatter name="Epochs" data={filteredMetrics} fill="#8884d8">
+                  {filteredMetrics.map((entry, index) => (
                     <Cell key={`cell-${index}`} fill={EPOCH_COLORS[index % EPOCH_COLORS.length]} />
                   ))}
                 </Scatter>
@@ -765,44 +761,27 @@ const AnalysisDashboard = ({
             <ArrowLeft size={20} />
          </button>
          <h2 className="text-xl font-bold text-white">Derived Metrics</h2>
-         <button className="ml-auto flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors">
-            <Download size={16} /> Export CSV
-         </button>
       </div>
-      
       <div className="flex-1 bg-slate-800 rounded-xl border border-slate-700 overflow-hidden flex flex-col shadow-xl">
          <div className="overflow-auto flex-1">
             <table className="w-full text-left text-sm text-slate-400">
               <thead className="bg-slate-900 text-slate-200 uppercase text-xs font-semibold sticky top-0 z-10">
                 <tr>
-                  <th className="px-6 py-4">Epoch ID</th>
-                  <th className="px-6 py-4">MJD</th>
+                  <th className="px-6 py-4">Epoch / File</th>
+                  <th className="px-6 py-4">Source ID</th>
                   <th className="px-6 py-4">Eq. Width (Å)</th>
-                  <th className="px-6 py-4">Centroid V (km/s)</th>
-                  <th className="px-6 py-4">Depth</th>
+                  <th className="px-6 py-4">Centroid V</th>
                   <th className="px-6 py-4">Components</th>
-                  <th className="px-6 py-4">Continuum Flux</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-700">
-                {metrics.map((row, i) => (
+                {filteredMetrics.map((row, i) => (
                   <tr key={i} className="hover:bg-slate-700/30 transition-colors">
-                    <td className="px-6 py-4 font-medium text-white">
-                       <div className="flex items-center gap-3">
-                          <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: EPOCH_COLORS[i % EPOCH_COLORS.length] }}></div>
-                          <span className="break-all">{row.epoch}</span>
-                       </div>
-                    </td>
-                    <td className="px-6 py-4">{row.mjd.toFixed(1)}</td>
+                    <td className="px-6 py-4 font-medium text-white">{row.epoch}</td>
+                    <td className="px-6 py-4">{row.sourceId}</td>
                     <td className="px-6 py-4 text-emerald-400 font-mono">{row.ew.toFixed(2)}</td>
                     <td className="px-6 py-4 font-mono">{row.velocity.toFixed(0)}</td>
-                    <td className="px-6 py-4 font-mono">{row.depth.toFixed(3)}</td>
-                    <td className="px-6 py-4">
-                       <span className={`px-2 py-1 rounded-full text-xs ${row.troughCount > 1 ? 'bg-purple-500/20 text-purple-300' : 'bg-slate-700 text-slate-400'}`}>
-                          {row.troughCount} Detected
-                       </span>
-                    </td>
-                    <td className="px-6 py-4 font-mono">{row.continuumFlux.toFixed(2)}</td>
+                    <td className="px-6 py-4"><span className="bg-slate-700 text-slate-300 px-2 py-1 rounded-full text-xs">{row.troughCount}</span></td>
                   </tr>
                 ))}
               </tbody>
@@ -835,10 +814,7 @@ const SourceCodeBrowser = () => {
               <div 
                 key={fileName}
                 onClick={() => setSelectedFile(fileName)}
-                className={`
-                  flex items-center px-3 py-2 cursor-pointer hover:bg-slate-800 transition-colors
-                  ${fileName === selectedFile ? 'bg-blue-900/30 text-blue-400 border-r-2 border-blue-500' : ''}
-                `}
+                className={`flex items-center px-3 py-2 cursor-pointer hover:bg-slate-800 transition-colors ${fileName === selectedFile ? 'bg-blue-900/30 text-blue-400 border-r-2 border-blue-500' : ''}`}
               >
                 <FileCode size={14} className="mr-2 opacity-70" />
                 {fileName}
@@ -861,28 +837,71 @@ const App = () => {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'code'>('dashboard');
   const [showChat, setShowChat] = useState(true);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>(DEFAULT_FILES);
-  const [analysisState, setAnalysisState] = useState<{ data: any[]; metrics: AnalysisMetric[]; z: number; fileMeta: FileMetadata[] }>({ data: [], metrics: [], z: 2.34, fileMeta: [] });
+  const [analysisState, setAnalysisState] = useState<{ 
+      data: any[]; 
+      metrics: AnalysisMetric[]; 
+      z: number; 
+      fileMeta: FileMetadata[];
+      sources: string[]; 
+  }>({ data: [], metrics: [], z: 2.34, fileMeta: [], sources: [] });
+  
   const [isProcessing, setIsProcessing] = useState(false);
+  const [selectedSources, setSelectedSources] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const { data, metrics, z, fileMeta } = generateAnalysisData(DEFAULT_FILES);
-    setAnalysisState({ data, metrics, z, fileMeta });
-  }, []);
+    setIsProcessing(true);
+    const process = async () => {
+        const { data, metrics, z, fileMeta, sources } = await generateAnalysisData(uploadedFiles);
+        setAnalysisState({ data, metrics, z, fileMeta, sources });
+        // By default select all sources initially
+        if (sources.length > 0 && selectedSources.length === 0) {
+            setSelectedSources(sources);
+        } else if (sources.length > 0) {
+             // Keep existing selection but add new ones if any? or just valid ones
+             setSelectedSources(prev => prev.filter(s => sources.includes(s)));
+             if (selectedSources.length === 0) setSelectedSources(sources); 
+        }
+        setIsProcessing(false);
+    };
+    process();
+  }, [uploadedFiles]);
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (files && files.length > 0) {
-      const fileList = Array.from(files);
-      setUploadedFiles(fileList);
-      setIsProcessing(true);
-      
-      setTimeout(() => {
-        const { data, metrics, z, fileMeta } = generateAnalysisData(fileList);
-        setAnalysisState({ data, metrics, z, fileMeta });
-        setIsProcessing(false);
-      }, 1500);
+      const newFiles = Array.from(files);
+      const uniqueNewFiles = newFiles.filter(newFile => 
+        !uploadedFiles.some(existingFile => existingFile.name === newFile.name)
+      );
+      setUploadedFiles(prev => [...prev, ...uniqueNewFiles]);
+      if (event.target) event.target.value = "";
     }
+  };
+
+  const handleRemoveFile = (fileName: string) => {
+    setUploadedFiles(prev => prev.filter(f => f.name !== fileName));
+  };
+
+  const handleClearAll = () => {
+    if (window.confirm("Are you sure you want to clear all loaded spectra?")) {
+       setUploadedFiles([]);
+    }
+  };
+
+  const handleRestoreDefaults = () => {
+    setUploadedFiles(DEFAULT_FILES);
+  };
+  
+  const handleToggleSource = (sourceId: string) => {
+      setSelectedSources(prev => {
+          if (prev.includes(sourceId)) {
+             // Don't allow unselecting the last one for UX reasons, or allow?
+             return prev.filter(s => s !== sourceId);
+          } else {
+             return [...prev, sourceId];
+          }
+      });
   };
 
   return (
@@ -899,53 +918,56 @@ const App = () => {
           </div>
         </div>
         
-        <nav className="flex-1 p-2 lg:p-4 space-y-2 overflow-hidden flex flex-col">
-          <button 
-            onClick={() => setActiveTab('dashboard')}
-            className={`w-full flex-shrink-0 flex items-center justify-center lg:justify-start gap-3 px-3 lg:px-4 py-3 rounded-lg transition-all ${activeTab === 'dashboard' ? 'bg-slate-800 text-white border border-slate-700' : 'text-slate-400 hover:bg-slate-800/50 hover:text-white'}`}
-            title="Dashboard"
-          >
+        <nav className="flex-1 p-2 lg:p-4 flex flex-col gap-2 min-h-0">
+          <button onClick={() => setActiveTab('dashboard')} className={`w-full flex items-center justify-center lg:justify-start gap-3 px-3 lg:px-4 py-3 rounded-lg transition-all ${activeTab === 'dashboard' ? 'bg-slate-800 text-white border border-slate-700' : 'text-slate-400 hover:bg-slate-800/50 hover:text-white'}`}>
             <LayoutDashboard size={20} />
             <span className="hidden lg:block font-medium">Dashboard</span>
           </button>
-          <button 
-            onClick={() => setActiveTab('code')}
-            className={`w-full flex-shrink-0 flex items-center justify-center lg:justify-start gap-3 px-3 lg:px-4 py-3 rounded-lg transition-all ${activeTab === 'code' ? 'bg-slate-800 text-white border border-slate-700' : 'text-slate-400 hover:bg-slate-800/50 hover:text-white'}`}
-            title="Source Code"
-          >
+          <button onClick={() => setActiveTab('code')} className={`w-full flex items-center justify-center lg:justify-start gap-3 px-3 lg:px-4 py-3 rounded-lg transition-all ${activeTab === 'code' ? 'bg-slate-800 text-white border border-slate-700' : 'text-slate-400 hover:bg-slate-800/50 hover:text-white'}`}>
             <FileCode size={20} />
             <span className="hidden lg:block font-medium">Codebase</span>
           </button>
-          
-          <div className="pt-6 mt-2 border-t border-slate-800 flex flex-col overflow-hidden">
-            <button 
-              onClick={() => fileInputRef.current?.click()}
-              className="w-full flex-shrink-0 flex items-center justify-center lg:justify-start gap-3 px-3 lg:px-4 py-3 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-all border border-emerald-500/20 border-dashed"
-              title="Upload FITS"
-            >
-              <Upload size={20} />
-              <span className="hidden lg:block font-medium">Upload FITS</span>
-            </button>
-            <input type="file" multiple accept=".fits" className="hidden" ref={fileInputRef} onChange={handleFileUpload} />
 
-            {/* File List Section */}
-            {uploadedFiles.length > 0 && (
-              <div className="mt-4 px-2 hidden lg:flex flex-col min-h-0">
-                 <div className="text-[10px] uppercase text-slate-500 font-bold mb-2 pl-2">Loaded Spectra</div>
-                 <div className="space-y-1 overflow-y-auto custom-scrollbar min-h-0 flex-1 pb-2">
-                    {uploadedFiles.map((f, i) => (
-                      <div key={i} className="flex items-center gap-2 px-2 py-1.5 text-xs text-slate-400 hover:bg-slate-800 rounded transition-colors select-none">
-                         <FileSpreadsheet size={12} className="flex-shrink-0 text-slate-600" />
-                         <span className="break-all leading-tight">{f.name}</span>
+          {/* Dataset Management Section */}
+          <div className="mt-auto pt-4 border-t border-slate-800 hidden lg:flex flex-col gap-2 min-h-0">
+             <div className="flex items-center justify-between px-2">
+                <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Dataset</span>
+                <span className="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded-full">{uploadedFiles.length}</span>
+             </div>
+
+             <div className="flex-1 min-h-[100px] max-h-[200px] overflow-y-auto custom-scrollbar space-y-1 mb-2 pr-1">
+                {uploadedFiles.map((file: any) => (
+                  <div key={file.name} className="group flex items-center justify-between px-2 py-1.5 rounded hover:bg-slate-800/50 transition-colors text-xs text-slate-400 border border-transparent hover:border-slate-700">
+                      <div className="flex items-center gap-2 overflow-hidden">
+                        <FileText size={12} className="flex-shrink-0 text-slate-500"/>
+                        <span className="truncate">{file.name}</span>
                       </div>
-                    ))}
-                 </div>
-              </div>
-            )}
+                      <button onClick={(e) => { e.stopPropagation(); handleRemoveFile(file.name); }} className="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-rose-400 transition-all p-1 hover:bg-slate-700 rounded">
+                        <X size={12} />
+                      </button>
+                  </div>
+                ))}
+                {uploadedFiles.length === 0 && (
+                   <div className="text-xs text-slate-600 italic px-2 py-4 text-center">
+                     No files loaded.
+                     <button onClick={handleRestoreDefaults} className="text-blue-500 hover:underline ml-1">Load examples</button>
+                   </div>
+                )}
+             </div>
+
+             <div className="grid grid-cols-2 gap-2">
+                <button onClick={() => fileInputRef.current?.click()} className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 transition-all border border-emerald-500/20 text-xs font-medium">
+                  <Plus size={14} /> Add
+                </button>
+                <input type="file" multiple accept=".fits" className="hidden" ref={fileInputRef} onChange={handleFileUpload} />
+                <button onClick={handleClearAll} disabled={uploadedFiles.length === 0} className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-rose-500/10 text-rose-400 hover:bg-rose-500/20 transition-all border border-rose-500/20 text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed">
+                  <Trash2 size={14} /> Clear
+                </button>
+             </div>
           </div>
         </nav>
 
-        <div className="p-4 border-t border-slate-800 hidden lg:block flex-shrink-0">
+        <div className="p-4 border-t border-slate-800 hidden lg:block">
            <button onClick={() => setShowChat(!showChat)} className={`w-full flex items-center justify-between px-4 py-2 rounded-md text-sm transition-colors ${showChat ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400'}`}>
              <span className="flex items-center gap-2"><MessageSquare size={16}/> AI Analyst</span>
              <span className="text-[10px] bg-white/20 px-1.5 py-0.5 rounded">{showChat ? 'ON' : 'OFF'}</span>
@@ -964,19 +986,16 @@ const App = () => {
               </div>
             </div>
             <h3 className="mt-6 text-xl font-bold text-white">Analyzing Spectra</h3>
-            <p className="text-slate-400 mt-2">Decomposing components...</p>
+            <p className="text-slate-400 mt-2">Running reduction pipeline...</p>
           </div>
         )}
 
         <header className="h-14 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-6 flex-shrink-0">
           <div className="flex items-center gap-4">
              <span className="text-slate-500"><Search size={16}/></span>
-             <span className="text-sm text-slate-400">Project: <span className="text-slate-200 font-medium">J1234_BAL_Study</span></span>
-          </div>
-          <div className="flex items-center gap-3">
-            <button className="p-2 hover:bg-slate-800 rounded-full text-slate-400 transition-colors lg:hidden" onClick={() => setShowChat(!showChat)}>
-               <MessageSquare size={20} className={showChat ? "text-blue-400" : ""} />
-            </button>
+             <span className="text-sm text-slate-400">Project: <span className="text-slate-200 font-medium">
+               {analysisState.sources.length > 1 ? "Multi-Object Study" : (analysisState.sources[0] || "Unknown")}
+             </span></span>
           </div>
         </header>
 
@@ -986,19 +1005,20 @@ const App = () => {
               <AnalysisDashboard 
                 data={analysisState.data} 
                 metrics={analysisState.metrics}
-                sourceName={uploadedFiles[0].name.split('_')[0] || "QSO Object"}
                 z={analysisState.z}
                 fileMeta={analysisState.fileMeta}
+                availableSources={analysisState.sources}
+                selectedSources={selectedSources}
+                onToggleSource={handleToggleSource}
               />
             ) : (
               <SourceCodeBrowser />
             )}
           </main>
           
-          {/* AI Chat Sidebar */}
           {showChat && activeTab === 'dashboard' && (
             <aside className="w-80 border-l border-slate-800 bg-slate-900 flex-shrink-0 transition-all duration-300">
-              <AIChatPanel metrics={analysisState.metrics} z={analysisState.z} />
+              <AIChatPanel metrics={analysisState.metrics.filter(m => selectedSources.includes(m.sourceId))} z={analysisState.z} />
             </aside>
           )}
         </div>
