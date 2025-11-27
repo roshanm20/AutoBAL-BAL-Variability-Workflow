@@ -7,9 +7,6 @@
 [![Vite](https://img.shields.io/badge/Vite-6.2-646CFF?logo=vite)](https://vitejs.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript)](https://www.typescriptlang.org/)
 [![Gemini AI](https://img.shields.io/badge/AI-Gemini%202.5%20Flash-8E75B2?logo=google-gemini)](https://deepmind.google/technologies/gemini/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-<img width="1200" height="600" alt="AutoBAL Dashboard" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 
 </div>
 
@@ -102,4 +99,4 @@ Contributions are welcome! Please open an issue or submit a pull request for any
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is opensource and made for educational purpose.
